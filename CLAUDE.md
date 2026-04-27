@@ -11,13 +11,12 @@ This is a learning project. The user is a beginner studying CubeFS source code t
 ```
 note/
 ├── 00-环境配置/          # Environment setup
+├── 01-metanode/          # MetaNode notes
+├── 02-master/            # Master notes (start with 00-初学者指南.md)
 ├── 03-datanode/          # DataNode notes
-├── 04-master/            # Master notes  
 ├── 09-tiglabs-raft/      # Raft library deep dive
-│   ├── 00-初学者指南.md   # Beginner guide (start here)
-│   ├── layer1-整体架构.md
-│   ├── layer2-raftserver.md
-│   └── ...
+│   ├── 00-初学者指南.md   # Beginner guide
+│   └── layer1~7          # Layer by layer
 └── ...
 ```
 
