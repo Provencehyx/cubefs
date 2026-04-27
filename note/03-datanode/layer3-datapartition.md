@@ -1,231 +1,270 @@
 # Layer 3: DataPartition 核心
 
-## 1. DataPartition 结构
+## 核心问题
 
-DataPartition 是数据分区的核心结构，管理一组 Extent 文件的存储和副本复制。
-
-```go
-// partition.go:102
-type DataPartition struct {
-    // 基本信息
-    clusterID       string
-    volumeID        string
-    partitionID     uint64
-    partitionStatus int
-    partitionSize   int              // 分区大小 (默认 120GB)
-    partitionType   int              // Normal / Tiny
-    replicaNum      int              // 副本数
-    
-    // 副本信息
-    replicas        []string         // 副本地址列表
-    isLeader        bool             // 是否 Leader
-    isRaftLeader    bool             // Raft Leader
-    
-    // 存储相关
-    disk            *Disk            // 所属磁盘
-    path            string           // 分区目录路径
-    extentStore     *storage.ExtentStore  // Extent 存储引擎
-    
-    // Raft 相关
-    raftPartition   raftstore.Partition   // Raft 分区
-    appliedID       uint64           // 已应用的 Raft 日志 ID
-    lastTruncateID  uint64           // 上次截断的日志 ID
-    
-    // 控制通道
-    stopC           chan bool
-    stopRaftC       chan uint64
-    storeC          chan uint64
-    
-    // 状态
-    raftStatus      int32            // Raft 运行状态
-    used            int              // 已用空间
-    leaderSize      int              // Leader 上的大小
-}
-```
-
-## 2. 元数据结构
-
-```go
-// partition.go:68
-type DataPartitionMetadata struct {
-    VolumeID                string              // 所属卷
-    PartitionID             uint64              // 分区 ID
-    PartitionSize           int                 // 分区大小
-    PartitionType           int                 // 分区类型
-    CreateTime              string              // 创建时间
-    Peers                   []proto.Peer        // Raft 成员
-    Hosts                   []string            // 副本主机列表
-    ReplicaNum              int                 // 副本数
-    LastTruncateID          uint64              // 最后截断 ID
-    ApplyID                 uint64              // 应用 ID
-    DataPartitionCreateType int                 // 创建类型
-}
-```
-
-## 3. 分区目录结构
-
-```
-datapartition_1001_3/              # 分区目录 (ID_副本数)
-├── META                           # 元数据 JSON 文件
-├── APPLY                          # 已应用的 Raft ID
-├── .dpStatus                      # 分区状态
-├── EXTENT_CRC                     # Extent CRC 校验
-├── EXTENT_META                    # Extent 元信息
-├── TINYEXTENT_DELETE              # Tiny Extent 删除记录
-├── NORMALEXTENT_DELETE            # Normal Extent 删除记录
-├── wal_1001/                      # Raft WAL 日志
-│   └── ...
-├── 1                              # Extent 文件 (ID 1-64 为 TinyExtent)
-├── 2
-├── ...
-├── 1024                           # Normal Extent (ID >= 1024)
-├── 1025
-└── ...
-```
-
-## 4. DataPartition 与 MetaPartition 对比
-
-| 维度 | DataPartition | MetaPartition |
-|------|---------------|---------------|
-| 存储内容 | 文件数据 (Extent) | 元数据 (inode/dentry) |
-| 存储方式 | 多个文件 (每个 Extent 一个) | 内存 B-Tree + 快照 |
-| 分区大小 | 120GB (默认) | 较小 |
-| Extent 类型 | Tiny (1-64) + Normal (1024+) | 无 |
-| 副本同步 | Raft + 主从复制 | 纯 Raft |
-| 数据修复 | 按 Extent 修复 | 按分区快照修复 |
-
-## 5. 分区类型
-
-### 5.1 Normal Partition
-- 存储普通大小文件
-- 使用 Normal Extent (ID >= 1024)
-- 每个 Extent 最大 128MB
-
-### 5.2 Tiny Partition (已废弃，保留兼容)
-- 存储小文件
-- 使用 Tiny Extent (ID 1-64)
-- 多个小文件共享一个 Extent
-
-## 6. 生命周期
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   DataPartition 生命周期                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────┐     ┌──────────┐     ┌──────────┐            │
-│  │  Create  │────▶│  Normal  │────▶│  Delete  │            │
-│  └──────────┘     └──────────┘     └──────────┘            │
-│       │                │                                    │
-│       │                ▼                                    │
-│       │          ┌──────────┐                               │
-│       │          │ ReadOnly │  (空间满/下线)                 │
-│       │          └──────────┘                               │
-│       │                │                                    │
-│       ▼                ▼                                    │
-│  ┌──────────────────────────┐                               │
-│  │       Recovering         │  (副本修复中)                  │
-│  └──────────────────────────┘                               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 7. 核心操作
-
-### 7.1 创建分区
-
-```go
-// partition.go:199
-func CreateDataPartition(dpCfg *dataPartitionCfg, disk *Disk, 
-    request *proto.CreateDataPartitionRequest) (dp *DataPartition, err error) {
-    
-    // 1. 创建分区实例
-    dp, err = newDataPartition(dpCfg, disk, true)
-    
-    // 2. 注册到 SpaceManager
-    disk.space.partitions[dp.partitionID] = dp
-    
-    // 3. 加载 Extent 头信息
-    dp.ForceLoadHeader()
-    
-    // 4. 启动 Raft
-    err = dp.StartRaft(false)
-    
-    // 5. 持久化元数据
-    err = dp.PersistMetadata()
-    
-    return
-}
-```
-
-### 7.2 加载分区
-
-```go
-// partition.go:281
-func LoadDataPartition(partitionDir string, disk *Disk) (dp *DataPartition, err error) {
-    // 1. 读取 META 文件
-    metaFileData, err = ioutil.ReadFile(path.Join(partitionDir, "META"))
-    
-    // 2. 解析元数据
-    meta := &DataPartitionMetadata{}
-    json.Unmarshal(metaFileData, meta)
-    
-    // 3. 创建分区实例
-    dp, err = newDataPartition(dpCfg, disk, false)
-    
-    // 4. 启动 Raft
-    dp.StartRaft(true)
-    
-    return
-}
-```
-
-### 7.3 写入数据
-
-```
-Client 写请求
-       │
-       ▼
-DataPartition.Write()
-       │
-       ├── 1. 检查是否 Leader
-       │
-       ├── 2. 分配/获取 Extent
-       │        │
-       │        ▼
-       │   ExtentStore.Write()
-       │
-       ├── 3. 提交 Raft 日志
-       │        │
-       │        ▼
-       │   raftPartition.Submit()
-       │
-       └── 4. 同步到副本 (Raft)
-```
-
-## 8. 分区状态
-
-| 状态 | 值 | 说明 |
-|------|-----|------|
-| Unavailable | -1 | 不可用 |
-| ReadOnly | 1 | 只读 |
-| ReadWrite | 2 | 可读写 |
-| Recovering | 3 | 恢复中 |
-
-## 9. 关键代码位置
-
-| 功能 | 文件:行号 |
-|------|-----------|
-| DataPartition 结构 | partition.go:102 |
-| 元数据结构 | partition.go:68 |
-| 创建分区 | partition.go:199 |
-| 加载分区 | partition.go:281 |
-| 启动 Raft | partition_raft.go |
-| Raft 状态机 | partition_raftfsm.go |
+1. **为什么分区大小是 120GB？**
+2. **分区元数据如何持久化？**
+3. **isLeader 和 isRaftLeader 有什么区别？**
 
 ---
 
-## 下一步
-- Layer 4: Extent 存储引擎详解
+## 1. 分区大小设计
 
-*创建时间：2026-04-12*
+```go
+// util/unit.go:35
+DefaultDataPartitionSize = 120 * GB
+```
+
+### 为什么是 120GB？
+
+| 分区大小 | 优点 | 缺点 |
+|----------|------|------|
+| 太小 (10GB) | 故障恢复快 | 分区数量爆炸，管理开销大 |
+| 太大 (1TB) | 分区数量少 | 故障恢复慢，一个坏分区影响大 |
+| 120GB | 平衡点 | — |
+
+**计算**：
+- 假设网络带宽 1Gbps ≈ 100MB/s
+- 修复 120GB 需要 ~20 分钟
+- 可接受的恢复时间窗口
+
+### 分区数量示例
+
+```
+10TB 卷，3 副本，分区大小 120GB:
+  分区数 = 10TB / 120GB ≈ 85 个
+  副本总数 = 85 × 3 = 255 个
+  
+分布在 10 个 DataNode 上：
+  每节点 ≈ 25 个分区副本，可管理
+```
+
+---
+
+## 2. 两个 Leader 的区别
+
+```go
+type DataPartition struct {
+    isLeader     bool   // 复制协议 Leader
+    isRaftLeader bool   // Raft 协议 Leader
+}
+```
+
+**为什么有两个？**
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    一个分区的两套协议                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  链式复制 (isLeader)              Raft (isRaftLeader)         │
+│  ─────────────────────           ────────────────────         │
+│  用途: 数据写入                   用途: 成员变更、随机写        │
+│  Client 写 → Leader              成员变更 → Raft Leader       │
+│    → Follower1 → Follower2       随机覆盖写 → Raft Leader     │
+│                                                               │
+│  通常两个角色在同一节点，但理论上可以分离                        │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**实际情况**：
+- 两个 Leader 通常是同一个节点
+- 但代码分开跟踪，为了灵活性
+
+---
+
+## 3. 元数据持久化
+
+### META 文件内容
+
+```json
+{
+    "VolumeID": "vol1",
+    "PartitionID": 1001,
+    "PartitionSize": 128849018880,
+    "Peers": [
+        {"ID": 1, "Addr": "192.168.1.1:17310"},
+        {"ID": 2, "Addr": "192.168.1.2:17310"},
+        {"ID": 3, "Addr": "192.168.1.3:17310"}
+    ],
+    "Hosts": ["192.168.1.1:17310", "192.168.1.2:17310", "192.168.1.3:17310"],
+    "ReplicaNum": 3,
+    "ApplyID": 12345,
+    "LastTruncateID": 10000
+}
+```
+
+### 为什么需要持久化 ApplyID？
+
+```
+场景：DataNode 重启
+
+没有持久化 ApplyID:
+  1. 重启后 ApplyID = 0
+  2. Raft 日志被 truncate 了
+  3. 找不到日志 0-10000
+  4. 分区无法恢复！
+
+有持久化 ApplyID:
+  1. 重启后读取 ApplyID = 12345
+  2. 从 12345 开始重放
+  3. 正常恢复
+```
+
+### 持久化时机
+
+```go
+// 单独的 APPLY 文件，高频更新
+func (dp *DataPartition) persistApplyID() {
+    // 写入 APPLY 文件
+    // 比 META 更频繁，因为 ApplyID 每次 Raft 操作都变化
+}
+```
+
+**为什么 APPLY 单独存？**
+- ApplyID 变化频繁（每次 Raft 操作）
+- META 其他字段变化少（成员变更时）
+- 分开存避免频繁重写整个 META
+
+---
+
+## 4. 目录结构设计
+
+```
+datapartition_1001_3/               # 命名: datapartition_{ID}_{副本数}
+├── META                            # 分区元数据 (JSON)
+├── APPLY                           # Raft ApplyID (二进制)
+├── EXTENT_CRC                      # 所有 Extent 的 CRC
+├── EXTENT_META                     # Extent 分配信息
+├── TINYEXTENT_DELETE               # TinyExtent 删除记录
+├── NORMALEXTENT_DELETE             # NormalExtent 删除记录
+├── wal_1001/                       # Raft WAL 日志
+│   ├── 00000001.log
+│   └── ...
+├── 1, 2, ... 64                    # TinyExtent 文件
+└── 1024, 1025, ...                 # NormalExtent 文件
+```
+
+### 各文件作用
+
+| 文件 | 作用 | 更新频率 |
+|------|------|----------|
+| `META` | Raft 成员、分区配置 | 低（成员变更时） |
+| `APPLY` | Raft apply 位点 | 高（每次 Raft 操作） |
+| `EXTENT_CRC` | 数据完整性校验 | 中（写入时） |
+| `*_DELETE` | 软删除记录 | 中（删除时） |
+| `wal_*/` | Raft 日志 | 高 |
+
+---
+
+## 5. 生命周期
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                     DataPartition 生命周期                     │
+├───────────────────────────────────────────────────────────────┤
+│                                                                │
+│  Master 分配     DataNode 创建      正常服务                    │
+│  ─────────────   ─────────────      ──────────                 │
+│                                                                │
+│  ┌──────────┐    ┌──────────┐       ┌──────────┐              │
+│  │ Allocate │───▶│  Create  │──────▶│ ReadWrite│              │
+│  └──────────┘    └──────────┘       └────┬─────┘              │
+│                                          │                     │
+│                            ┌─────────────┼─────────────┐       │
+│                            ▼             ▼             ▼       │
+│                      ┌──────────┐  ┌──────────┐  ┌──────────┐ │
+│                      │ ReadOnly │  │Recovering│  │  Delete  │ │
+│                      │(空间满)   │  │(副本修复) │  │(卷删除)  │ │
+│                      └──────────┘  └──────────┘  └──────────┘ │
+│                                                                │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 状态转换触发条件
+
+| 从 | 到 | 触发条件 |
+|----|-----|----------|
+| ReadWrite | ReadOnly | 分区空间不足 / 磁盘空间不足 |
+| ReadWrite | Recovering | 发现副本数据不一致 |
+| Recovering | ReadWrite | 修复完成 |
+| 任意 | Delete | 卷被删除 / 管理员删除 |
+
+---
+
+## 6. 创建与加载
+
+### 创建流程
+
+```
+Master 请求创建 ─────────────────────────────────────────────────
+       │
+       ▼
+SpaceManager.CreatePartition()
+       │
+       ├── 1. selectDisk()            选择磁盘 (Straw 算法)
+       │
+       ├── 2. os.Mkdir(path)          创建目录
+       │
+       ├── 3. newDataPartition()      创建内存结构
+       │
+       ├── 4. NewExtentStore()        创建存储引擎
+       │
+       ├── 5. StartRaft()             启动 Raft (空成员)
+       │
+       └── 6. PersistMetadata()       写入 META 文件
+```
+
+### 加载流程（重启时）
+
+```
+DataNode 启动 ─────────────────────────────────────────────────
+       │
+       ▼
+disk.RestorePartition()
+       │
+       └── 遍历 datapartition_* 目录
+           │
+           ▼
+       LoadDataPartition()
+           │
+           ├── 1. 读取 META 文件
+           │
+           ├── 2. 读取 APPLY 文件 (获取 ApplyID)
+           │
+           ├── 3. newDataPartition()
+           │
+           ├── 4. NewExtentStore()
+           │
+           └── 5. StartRaft(isLoad=true)  ← 从 ApplyID 恢复
+```
+
+---
+
+## 7. DataPartition vs MetaPartition
+
+| 维度 | DataPartition | MetaPartition |
+|------|---------------|---------------|
+| 存储内容 | 文件字节数据 | inode/dentry |
+| 存储引擎 | 裸文件 (Extent) | RocksDB |
+| 分区大小 | 120GB | 不限（按 inode 数量分裂） |
+| 复制协议 | 链式复制 + Raft | 纯 Raft |
+| Raft 用途 | 成员变更、随机写 | 所有写操作 |
+| 修复粒度 | 单个 Extent | 整个快照 |
+
+---
+
+## 8. 关键代码
+
+| 功能 | 位置 | 要点 |
+|------|------|------|
+| 分区大小定义 | util/unit.go:35 | `DefaultDataPartitionSize = 120 * GB` |
+| 创建分区 | partition.go:199 | `CreateDataPartition()` |
+| 加载分区 | partition.go | `LoadDataPartition()` |
+| 持久化 ApplyID | partition.go | `persistApplyID()` 独立于 META |
+| 启动 Raft | partition_raft.go:85 | `StartRaft()` |
+
+---
+
+*更新时间：2026-04-27*

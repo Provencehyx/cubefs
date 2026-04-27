@@ -1,260 +1,212 @@
 # Layer 6: Raft 一致性
 
-## 1. DataNode 中 Raft 的角色
+## 核心问题
 
-与 MetaNode 不同，DataNode 的 Raft 主要用于**控制面**操作，而非数据写入。
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    DataPartition                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   ┌─────────────────────────┐   ┌─────────────────────────┐ │
-│   │      数据面 (Data)       │   │    控制面 (Control)     │ │
-│   ├─────────────────────────┤   ├─────────────────────────┤ │
-│   │                         │   │                         │ │
-│   │   链式复制              │   │      Raft               │ │
-│   │   - Extent 写入         │   │   - 随机写同步           │ │
-│   │   - Extent 读取         │   │   - 成员变更             │ │
-│   │   - 顺序写入            │   │   - Leader 选举         │ │
-│   │                         │   │   - 元数据同步           │ │
-│   └─────────────────────────┘   └─────────────────────────┘ │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 2. dataPartitionCfg 配置
-
-```go
-// partition_raft.go:42
-type dataPartitionCfg struct {
-    VolName       string              // 卷名
-    ClusterID     string              // 集群 ID
-    PartitionID   uint64              // 分区 ID
-    PartitionSize int                 // 分区大小
-    PartitionType int                 // 分区类型
-    Peers         []proto.Peer        // Raft 成员
-    Hosts         []string            // 主机列表
-    NodeID        uint64              // 节点 ID
-    RaftStore     raftstore.RaftStore // Raft 存储
-    ReplicaNum    int                 // 副本数
-}
-```
-
-## 3. 启动 Raft
-
-```go
-// partition_raft.go:85
-func (dp *DataPartition) StartRaft(isLoad bool) (err error) {
-    // 1. 获取 Raft 端口
-    heartbeatPort, replicaPort, err := dp.raftPort()
-    
-    // 2. 构建 Peer 地址列表
-    var peers []raftstore.PeerAddress
-    for _, peer := range dp.config.Peers {
-        rp := raftstore.PeerAddress{
-            Peer:          raftproto.Peer{ID: peer.ID},
-            Address:       addr,
-            HeartbeatPort: heartbeatPort,
-            ReplicaPort:   replicaPort,
-        }
-        peers = append(peers, rp)
-    }
-    
-    // 3. 创建 Raft 分区配置
-    pc := &raftstore.PartitionConfig{
-        ID:      dp.partitionID,
-        Applied: dp.appliedID,
-        Peers:   peers,
-        SM:      dp,          // DataPartition 实现状态机接口
-        WalPath: dp.path,
-    }
-    
-    // 4. 创建 Raft 分区
-    dp.raftPartition, err = dp.config.RaftStore.CreatePartition(pc)
-    
-    return
-}
-```
-
-## 4. 状态机接口实现
-
-DataPartition 实现 `raft.StateMachine` 接口：
-
-```go
-// partition_raftfsm.go
-
-// Apply 应用 Raft 日志
-func (dp *DataPartition) Apply(command []byte, index uint64) (resp interface{}, err error)
-
-// ApplyMemberChange 应用成员变更
-func (dp *DataPartition) ApplyMemberChange(confChange *raftproto.ConfChange, index uint64) (resp interface{}, err error)
-
-// Snapshot 创建快照
-func (dp *DataPartition) Snapshot() (raftproto.Snapshot, error)
-
-// ApplySnapshot 应用快照
-func (dp *DataPartition) ApplySnapshot(peers []raftproto.Peer, iter raftproto.SnapIterator) error
-
-// HandleFatalEvent 处理致命事件
-func (dp *DataPartition) HandleFatalEvent(err *raft.FatalError)
-
-// HandleLeaderChange 处理 Leader 变更
-func (dp *DataPartition) HandleLeaderChange(leader uint64)
-```
-
-## 5. Apply 流程
-
-```go
-// partition_raftfsm.go:37
-func (dp *DataPartition) Apply(command []byte, index uint64) (resp interface{}, err error) {
-    // 1. 解析版本号
-    buff := bytes.NewBuffer(command)
-    binary.Read(buff, binary.BigEndian, &version)
-    
-    // 2. 根据版本处理
-    if version != BinaryMarshalMagicVersion {
-        // 处理版本操作或修复状态操作
-        opItem, _ := UnmarshalRaftCmd(command)
-        if opItem.Op == proto.OpVersionOp {
-            dp.fsmVersionOp(opItem)
-        } else if opItem.Op == proto.OpSetRepairingStatus {
-            dp.fsmSetRepairingStatusOp(opItem)
-        }
-        return
-    }
-    
-    // 3. 应用随机写
-    if index > dp.metaAppliedID {
-        resp, err = dp.ApplyRandomWrite(command, index)
-    }
-    
-    return
-}
-```
-
-## 6. 成员变更
-
-```go
-// partition_raftfsm.go:70
-func (dp *DataPartition) ApplyMemberChange(confChange *raftproto.ConfChange, index uint64) (resp interface{}, err error) {
-    
-    switch confChange.Type {
-    case raftproto.ConfAddNode:
-        // 添加节点
-        req := &proto.AddDataPartitionRaftMemberRequest{}
-        json.Unmarshal(confChange.Context, req)
-        dp.addRaftNode(req, index)
-        
-    case raftproto.ConfRemoveNode:
-        // 移除节点
-        req := &proto.RemoveDataPartitionRaftMemberRequest{}
-        json.Unmarshal(confChange.Context, req)
-        dp.removeRaftNode(req, index)
-        
-    case raftproto.ConfUpdateNode:
-        // 暂不支持
-    }
-    
-    // 持久化元数据
-    dp.PersistMetadata()
-    
-    return
-}
-```
-
-## 7. 随机写与 Raft
-
-随机写需要通过 Raft 保证一致性：
-
-```
-客户端随机写请求
-       │
-       ▼
-┌──────────────────────────────────────────────────────────┐
-│                     Leader DataNode                       │
-├──────────────────────────────────────────────────────────┤
-│                                                          │
-│  1. 接收随机写请求                                        │
-│         │                                                │
-│         ▼                                                │
-│  2. 封装为 Raft Command                                   │
-│         │                                                │
-│         ▼                                                │
-│  3. raftPartition.Submit(command)                        │
-│         │                                                │
-│         ▼                                                │
-│  4. Raft 复制到 Followers                                 │
-│         │                                                │
-│         ▼                                                │
-│  5. Apply() 被调用                                        │
-│         │                                                │
-│         ▼                                                │
-│  6. ApplyRandomWrite() 执行实际写入                       │
-│         │                                                │
-│         ▼                                                │
-│  7. 返回响应                                              │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
-
-## 8. 顺序写 vs 随机写
-
-| 写入类型 | 一致性机制 | 说明 |
-|----------|-----------|------|
-| 顺序写 (Append) | 链式复制 | 性能优先，数据追加 |
-| 随机写 (Random) | Raft | 一致性优先，覆盖写 |
-
-```
-顺序写:
-  Client → DN1 → DN2 → DN3  (链式复制)
-  
-随机写:
-  Client → Leader (Raft) → Followers  (Raft 复制)
-```
-
-## 9. ApplyID 管理
-
-```go
-// DataPartition 中的 ApplyID 字段
-type DataPartition struct {
-    appliedID      uint64    // 已应用的 Raft 日志 ID
-    metaAppliedID  uint64    // 持久化时的 Apply ID
-    minAppliedID   uint64
-    maxAppliedID   uint64
-}
-
-// 更新 ApplyID
-func (dp *DataPartition) uploadApplyID(index uint64) {
-    atomic.StoreUint64(&dp.appliedID, index)
-}
-
-// 持久化 ApplyID
-dp.PersistApplyIdChan <- PersistApplyIdRequest{}
-```
-
-## 10. DataNode vs MetaNode Raft 对比
-
-| 维度 | DataNode | MetaNode |
-|------|----------|----------|
-| 主要用途 | 随机写、成员变更 | 所有元数据操作 |
-| 数据写入 | 链式复制（主） + Raft（辅） | 纯 Raft |
-| 快照内容 | Extent 信息 | inode/dentry 全量 |
-| Apply 频率 | 较低（仅随机写） | 很高（所有写操作） |
-
-## 11. 关键代码位置
-
-| 功能 | 文件:行号 |
-|------|-----------|
-| dataPartitionCfg | partition_raft.go:42 |
-| StartRaft | partition_raft.go:85 |
-| Apply | partition_raftfsm.go:37 |
-| ApplyMemberChange | partition_raftfsm.go:70 |
-| ApplyRandomWrite | partition_op_by_raft.go |
+1. **哪些操作必须走 Raft？**
+2. **为什么随机写需要 Raft？**
+3. **DataNode 的 Raft 和 MetaNode 有什么区别？**
 
 ---
 
-## 下一步
-- Layer 7: 数据修复
+## 1. Raft 在 DataNode 中的定位
 
-*创建时间：2026-04-12*
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        DataPartition                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌────────────────────────────┐  ┌────────────────────────────┐ │
+│  │    数据面 (链式复制)        │  │    控制面 (Raft)           │ │
+│  ├────────────────────────────┤  ├────────────────────────────┤ │
+│  │                            │  │                            │ │
+│  │  高频操作:                  │  │  低频操作:                  │ │
+│  │  - 追加写 (顺序写)          │  │  - 随机写 (覆盖写)          │ │
+│  │  - 读取                    │  │  - 成员变更 (AddNode)       │ │
+│  │  - 删除                    │  │  - Leader 选举              │ │
+│  │                            │  │                            │ │
+│  │  特点: 高吞吐              │  │  特点: 强一致               │ │
+│  └────────────────────────────┘  └────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+与 MetaNode 对比:
+- MetaNode: 所有写操作都走 Raft
+- DataNode: 只有随机写和成员变更走 Raft
+```
+
+---
+
+## 2. 为什么随机写需要 Raft？
+
+### 问题：并发覆盖写
+
+```
+场景：两个 Client 同时写入同一位置
+
+Client1: Write(offset=100, data="AAA")
+Client2: Write(offset=100, data="BBB")
+
+如果用链式复制（没有 Raft）:
+┌──────────────────────────────────────────────────────────────────┐
+│  时间轴     Leader        Follower1       Follower2              │
+│  ──────────────────────────────────────────────────────────────  │
+│  T1        收到 AAA       -               -                      │
+│  T2        收到 BBB       -               -                      │
+│  T3        先写 AAA       先收到 BBB      先收到 AAA             │
+│  T4        再写 BBB       再收到 AAA      再收到 BBB             │
+│  ──────────────────────────────────────────────────────────────  │
+│  结果:     BBB           AAA             BBB                     │
+│  ──────────────────────────────────────────────────────────────  │
+│  数据不一致！                                                    │
+└──────────────────────────────────────────────────────────────────┘
+
+如果用 Raft:
+  1. 所有随机写提交到 Leader 的 Raft 日志
+  2. Raft 确定全局顺序: [AAA, BBB] 或 [BBB, AAA]
+  3. 所有副本按此顺序执行
+  4. 最终结果一致
+```
+
+### 追加写为什么不需要？
+
+```
+追加写 (Append):
+  Client1: Append("AAA")  → offset=0
+  Client2: Append("BBB")  → offset=3
+
+无论哪个先到，结果都是:
+  offset 0-2: AAA
+  offset 3-5: BBB
+  
+不会覆盖，没有冲突
+```
+
+---
+
+## 3. 哪些操作走 Raft？
+
+| 操作类型 | 走 Raft | 原因 |
+|----------|---------|------|
+| 追加写 | 否 | 不冲突，链式复制足够 |
+| 随机写 (覆盖) | 是 | 需要全局顺序 |
+| 成员变更 | 是 | 配置必须一致 |
+| 设置修复状态 | 是 | 状态必须一致 |
+| 删除 Extent | 否 | 通过删除记录同步 |
+| 读取 | 否 | 读不修改状态 |
+
+---
+
+## 4. Apply 流程
+
+```go
+// partition_raftfsm.go:37
+func (dp *DataPartition) Apply(command []byte, index uint64) {
+    // 解析命令类型
+    if opItem.Op == proto.OpVersionOp {
+        dp.fsmVersionOp(opItem)        // 版本操作
+    } else if opItem.Op == proto.OpSetRepairingStatus {
+        dp.fsmSetRepairingStatusOp(opItem)  // 设置修复状态
+    } else {
+        dp.ApplyRandomWrite(command, index)  // 随机写
+    }
+}
+```
+
+**Apply 的内容很少**：
+- DataNode 的 Raft 只处理随机写和状态变更
+- 追加写不走 Raft，不会调用 Apply
+
+---
+
+## 5. 成员变更
+
+```
+场景：扩容，添加新副本
+
+Master 决定添加 DN4 到分区 1001
+        │
+        ▼
+Leader.raftPartition.SubmitConfChange(AddNode, DN4)
+        │
+        ▼
+Raft 日志复制到所有副本
+        │
+        ▼
+所有副本执行 ApplyMemberChange()
+        ├── 更新 Peers 列表
+        ├── 持久化 META 文件
+        └── 新副本加入链式复制
+```
+
+**为什么成员变更必须走 Raft？**
+- 所有副本必须对"谁是成员"达成一致
+- 否则链式复制的链会断
+
+---
+
+## 6. DataNode vs MetaNode 的 Raft
+
+| 维度 | DataNode | MetaNode |
+|------|----------|----------|
+| Raft 用途 | 随机写 + 成员变更 | **所有写操作** |
+| Apply 频率 | 低（随机写少） | 高（每次写都走） |
+| 快照内容 | Extent 元信息 | inode/dentry 全量 |
+| 数据量 | 快照很小 | 快照可能很大 |
+
+### 为什么设计不同？
+
+```
+MetaNode:
+  - 数据量小（元数据）
+  - 每次操作都要强一致
+  - Raft 开销可接受
+
+DataNode:
+  - 数据量大（文件内容）
+  - 追加写占多数，不需要 Raft
+  - Raft 开销太高，影响吞吐
+  - 用链式复制处理大部分写入
+```
+
+---
+
+## 7. ApplyID 持久化
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     ApplyID 管理                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  内存:                                                           │
+│    appliedID = 12345      (当前已应用的 Raft 日志 ID)           │
+│                                                                  │
+│  磁盘 (APPLY 文件):                                              │
+│    metaAppliedID = 12300  (上次持久化的 ID)                      │
+│                                                                  │
+│  重启恢复:                                                       │
+│    1. 读取 APPLY 文件 → metaAppliedID = 12300                   │
+│    2. 从 12300 开始重放 Raft 日志                                │
+│    3. 恢复到最新状态                                             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**为什么单独存 ApplyID？**
+- ApplyID 变化频繁
+- META 文件其他内容变化少
+- 分开存减少 IO
+
+---
+
+## 8. 关键代码
+
+| 功能 | 位置 | 要点 |
+|------|------|------|
+| 启动 Raft | partition_raft.go:85 | `StartRaft()` |
+| Apply 入口 | partition_raftfsm.go:37 | `Apply()` 只处理随机写和状态变更 |
+| 随机写应用 | partition_op_by_raft.go | `ApplyRandomWrite()` |
+| 成员变更 | partition_raftfsm.go:70 | `ApplyMemberChange()` |
+
+---
+
+*更新时间：2026-04-27*

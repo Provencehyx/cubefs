@@ -1,289 +1,312 @@
 # Layer 7: 数据修复
 
-## 1. 修复机制概述
+## 核心问题
 
-DataNode 通过定期比较副本之间的 Extent 信息来发现和修复数据不一致。
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      数据修复流程                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   Leader                 Follower1            Follower2     │
-│     │                       │                     │         │
-│     │   1. 收集 Extent 信息  │                     │         │
-│     │◄──────────────────────│                     │         │
-│     │◄────────────────────────────────────────────│         │
-│     │                                                       │
-│     │   2. 比较各副本，找出最大/最新版本                      │
-│     │                                                       │
-│     │   3. 生成修复任务                                      │
-│     │                                                       │
-│     │   4. 通知需要修复的节点                                 │
-│     │────────────────────▶│                     │           │
-│     │──────────────────────────────────────────▶│           │
-│     │                                                       │
-│     │   5. 执行修复（从源节点拉取数据）                       │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 2. 修复任务结构
-
-```go
-// data_partition_repair.go:44
-type RepairExtentInfo struct {
-    storage.ExtentInfo
-    Source string    // 数据源地址（拥有完整数据的节点）
-}
-
-// data_partition_repair.go:57
-type DataPartitionRepairTask struct {
-    TaskType                       uint8              // Normal / Tiny
-    addr                           string             // 目标节点地址
-    extents                        map[uint64]*RepairExtentInfo
-    ExtentsToBeCreated             []*RepairExtentInfo  // 需要创建的 Extent
-    ExtentsToBeRepaired            []*RepairExtentInfo  // 需要修复的 Extent
-    LeaderTinyDeleteRecordFileSize int64
-    LeaderAddr                     string
-}
-```
-
-## 3. 两种修复类型
-
-### 3.1 Normal Extent 修复
-
-```
-Normal Extent 修复流程:
-┌────────────────────────────────────────────────────────────┐
-│                                                            │
-│  1. Leader 收集所有 Follower 的 Extent 信息                 │
-│                                                            │
-│  2. 对每个 Extent，比较所有副本找出最大 Size                 │
-│                                                            │
-│  3. 本地 Extent Size < 最大 Size → 加入修复列表              │
-│                                                            │
-│  4. 从拥有完整数据的节点拉取缺失部分                         │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
-
-### 3.2 Tiny Extent 修复
-
-```
-Tiny Extent 修复流程:
-┌────────────────────────────────────────────────────────────┐
-│                                                            │
-│  1. 创建分区时，所有 Tiny Extent 加入待修复列表              │
-│                                                            │
-│  2. Leader 定期收集各 Follower 的 Tiny Extent 信息          │
-│                                                            │
-│  3. 比较各副本，找出最大 Size                               │
-│                                                            │
-│  4. 本地 Size < 最大 Size → 修复                            │
-│                                                            │
-│  5. 同步 Tiny Extent 删除记录                               │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
-
-## 4. 修复主流程
-
-```go
-// data_partition_repair.go:102
-func (dp *DataPartition) repair(extentType uint8) {
-    // 1. 获取损坏的 Tiny Extent 列表
-    tinyExtents := dp.brokenTinyExtents()
-    
-    // 2. 构建修复任务（收集各副本信息）
-    repairTasks := make([]*DataPartitionRepairTask, len(replica))
-    dp.buildDataPartitionRepairTask(repairTasks, extentType, tinyExtents, replica)
-    
-    // 3. 比较所有副本，确定哪些需要修复
-    availableTinyExtents, brokenTinyExtents := dp.prepareRepairTasks(repairTasks)
-    
-    // 4. 通知各副本执行修复
-    dp.NotifyExtentRepair(repairTasks)
-    
-    // 5. Leader 执行自己的修复任务
-    dp.DoRepair(repairTasks)
-    
-    // 6. 更新 Extent 状态
-    dp.sendAllTinyExtentsToC(extentType, availableTinyExtents, brokenTinyExtents)
-}
-```
-
-## 5. 构建修复任务
-
-```go
-// data_partition_repair.go:166
-func (dp *DataPartition) buildDataPartitionRepairTask(...) {
-    // 1. 获取本地 Extent 信息
-    extents, leaderTinyDeleteRecordFileSize, _ := dp.getLocalExtentInfo(extentType, tinyExtents)
-    
-    // 2. 创建 Leader 的修复任务
-    repairTasks[0] = NewDataPartitionRepairTask(extents, 
-        leaderTinyDeleteRecordFileSize, 
-        dp.dataNode.localServerAddr,
-        dp.dataNode.localServerAddr, 
-        extentType)
-    
-    // 3. 从各 Follower 获取 Extent 信息并创建任务
-    for _, follower := range followers {
-        extentFiles := dp.getRemoteExtentInfo(follower, extentType, tinyExtents)
-        repairTasks[index] = NewDataPartitionRepairTask(extentFiles, ...)
-    }
-}
-```
-
-## 6. 比较与准备修复
-
-```
-比较逻辑:
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  Extent 1001:                                               │
-│    Replica1: Size = 100MB, CRC = 0xABC                     │
-│    Replica2: Size = 100MB, CRC = 0xABC                     │
-│    Replica3: Size = 80MB,  CRC = 0xDEF  ← 需要修复          │
-│                                                             │
-│  最大 Size = 100MB                                          │
-│  Replica3 需要从 Replica1 或 Replica2 补齐 20MB             │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 7. 执行修复
-
-```go
-// DoRepair 执行修复
-func (dp *DataPartition) DoRepair(repairTasks []*DataPartitionRepairTask) {
-    for _, task := range repairTasks {
-        // 处理需要创建的 Extent
-        for _, extent := range task.ExtentsToBeCreated {
-            dp.streamRepairExtent(extent)
-        }
-        
-        // 处理需要修复的 Extent
-        for _, extent := range task.ExtentsToBeRepaired {
-            dp.streamRepairExtent(extent)
-        }
-    }
-}
-
-// streamRepairExtent 从源节点流式拉取数据
-func (dp *DataPartition) streamRepairExtent(extentInfo *RepairExtentInfo) {
-    // 1. 连接源节点
-    conn := gConnPool.GetConnect(extentInfo.Source)
-    
-    // 2. 发送修复读请求
-    packet := repl.NewExtentRepairReadPacket(...)
-    packet.WriteToConn(conn)
-    
-    // 3. 接收数据并写入本地
-    for {
-        reply := repl.NewPacket()
-        reply.ReadFromConn(conn)
-        
-        // 写入本地 ExtentStore
-        dp.extentStore.Write(...)
-    }
-}
-```
-
-## 8. 修复触发条件
-
-| 触发条件 | 说明 |
-|----------|------|
-| 定时检查 | 周期性检查各副本一致性 |
-| 新分区创建 | 创建分区后初始化 Tiny Extent |
-| 副本恢复 | 副本重新上线后同步数据 |
-| Master 指令 | Master 检测到不一致后触发 |
-
-## 9. 修复相关常量
-
-```go
-// extent_store.go
-const (
-    RepairInterval = 60              // 修复检查间隔（秒）
-    UpdateCrcInterval = 600          // CRC 更新间隔（秒）
-)
-
-// partition.go
-const (
-    DpCheckBaseInterval = 7200       // 分区检查基础间隔
-    DpCheckRandomRange = 1800        // 随机范围
-)
-```
-
-## 10. 修复流程图
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    完整修复流程                               │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌─────────┐                                                 │
-│  │ 定时器   │                                                 │
-│  └────┬────┘                                                 │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │            repair(extentType)                        │    │
-│  └─────────────────────────────────────────────────────┘    │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │     buildDataPartitionRepairTask()                   │    │
-│  │     - 收集本地 Extent 信息                           │    │
-│  │     - 收集各 Follower Extent 信息                    │    │
-│  └─────────────────────────────────────────────────────┘    │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │     prepareRepairTasks()                             │    │
-│  │     - 比较各副本                                     │    │
-│  │     - 确定需要创建/修复的 Extent                     │    │
-│  └─────────────────────────────────────────────────────┘    │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │     NotifyExtentRepair()                             │    │
-│  │     - 通知各 Follower 执行修复                       │    │
-│  └─────────────────────────────────────────────────────┘    │
-│       │                                                      │
-│       ▼                                                      │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │     DoRepair()                                       │    │
-│  │     - 执行 Leader 自己的修复任务                     │    │
-│  │     - streamRepairExtent() 拉取数据                  │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-## 11. 关键代码位置
-
-| 功能 | 文件:行号 |
-|------|-----------|
-| RepairExtentInfo | data_partition_repair.go:44 |
-| DataPartitionRepairTask | data_partition_repair.go:57 |
-| repair 主函数 | data_partition_repair.go:102 |
-| 构建修复任务 | data_partition_repair.go:166 |
-| 流式修复 | data_partition_repair.go (streamRepairExtent) |
+1. **副本不一致如何检测？**
+2. **如何选择修复源？**
+3. **修复过程中新写入怎么处理？**
 
 ---
 
-## 总结
+## 1. 为什么需要数据修复？
 
-DataNode 笔记完成，共 7 层：
+### 不一致的来源
 
-1. **启动与配置** - DataNode 结构与启动流程
-2. **磁盘与空间管理** - SpaceManager 和 Disk
-3. **DataPartition** - 数据分区核心结构
-4. **Extent 存储** - 底层存储引擎
-5. **副本复制** - 链式复制协议
-6. **Raft 一致性** - 控制面一致性
-7. **数据修复** - 副本修复机制
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      可能导致不一致的场景                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. 网络分区                                                     │
+│     Client → Leader → Follower1 (成功)                          │
+│                    → Follower2 (网络断开，失败)                  │
+│                                                                  │
+│  2. 节点重启                                                     │
+│     写入进行中，Follower 重启                                    │
+│     重启后数据比其他副本少                                       │
+│                                                                  │
+│  3. 磁盘故障                                                     │
+│     磁盘坏块导致数据损坏                                         │
+│     CRC 校验失败                                                 │
+│                                                                  │
+│  4. 软件 bug                                                     │
+│     极端情况下写入不完整                                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-*创建时间：2026-04-12*
+### 修复的目标
+
+让所有副本的数据最终一致，采用**"最大版本获胜"**策略。
+
+---
+
+## 2. 检测机制
+
+### Leader 主动检测
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                     定期检测流程 (每 60 秒)                     │
+├───────────────────────────────────────────────────────────────┤
+│                                                                │
+│  Leader                                                        │
+│    │                                                           │
+│    │ 1. 收集本地 Extent 信息                                    │
+│    │    [{ID:1001, Size:100MB, CRC:0xABC}, ...]               │
+│    │                                                           │
+│    │ 2. 请求各 Follower 的 Extent 信息                         │
+│    │────────────────────▶ Follower1: [{ID:1001, Size:100MB}]  │
+│    │────────────────────▶ Follower2: [{ID:1001, Size:80MB}]   │
+│    │                                   ↑                       │
+│    │ 3. 比较发现 Follower2 的 1001 只有 80MB                   │
+│    │                                                           │
+│    │ 4. 生成修复任务: Follower2 需要补 20MB                     │
+│    │                                                           │
+└────┴───────────────────────────────────────────────────────────┘
+```
+
+### 比较规则
+
+| 情况 | 处理方式 |
+|------|----------|
+| Size 相同，CRC 相同 | 正常，无需修复 |
+| Size 不同 | 以最大 Size 为准 |
+| Size 相同，CRC 不同 | 按块比较，修复不一致的块 |
+| Extent 不存在 | 从有该 Extent 的副本拷贝 |
+
+---
+
+## 3. 修复源选择
+
+### 策略：优先 Leader，就近选择
+
+```
+Extent 1001 需要修复:
+  Leader:    Size = 100MB  ← 优先选择
+  Follower1: Size = 100MB  
+  Follower2: Size = 80MB   ← 需要修复
+
+原因:
+  - Leader 通常有最新数据
+  - 链式复制先写 Leader
+  - 减少网络跳转
+```
+
+### 修复数据结构
+
+```go
+type RepairExtentInfo struct {
+    storage.ExtentInfo        // Extent 基本信息
+    Source string             // 数据源地址
+}
+
+type DataPartitionRepairTask struct {
+    addr                string                      // 目标节点
+    ExtentsToBeCreated  []*RepairExtentInfo        // 缺失的 Extent
+    ExtentsToBeRepaired []*RepairExtentInfo        // 需要补齐的 Extent
+}
+```
+
+---
+
+## 4. 修复流程
+
+### 流式修复
+
+```
+需要修复: Follower2 的 Extent 1001 (80MB → 100MB)
+         │
+         ▼
+┌───────────────────────────────────────────────────────────────┐
+│ Follower2                                                     │
+│         │                                                     │
+│         │ 1. 连接 Leader                                      │
+│         │                                                     │
+│         │ 2. 发送修复读请求                                    │
+│         │    OpExtentRepairRead(extent=1001, offset=80MB)     │
+│         │────────────────────────────────────────────▶ Leader │
+│         │                                                     │
+│         │ 3. Leader 流式返回 80MB-100MB 的数据                 │
+│         │◀────────────────────────────────────────────        │
+│         │    [64KB block] [64KB block] ... [EOF]              │
+│         │                                                     │
+│         │ 4. 写入本地 ExtentStore                              │
+│         │    每个 block 校验 CRC 后写入                        │
+│         │                                                     │
+└─────────┴─────────────────────────────────────────────────────┘
+```
+
+### 为什么是流式？
+
+```
+Extent 可能很大 (128MB)
+  - 一次性读取: 内存压力大
+  - 流式读取: 每次 64KB，边读边写，内存可控
+```
+
+---
+
+## 5. 修复过程中的新写入
+
+### 问题
+
+```
+T1: 开始修复 Extent 1001 (0-100MB)
+T2: 新写入到达 Extent 1001 (追加 100-110MB)
+T3: 修复完成
+
+如果不处理:
+  修复只拷贝了 0-100MB
+  新写入的 100-110MB 可能丢失
+```
+
+### 解决方案
+
+```
+1. 修复期间分区不变为 ReadOnly
+   - 新写入正常进行
+   - 链式复制会同步到所有副本
+
+2. 修复结束后再次检测
+   - 发现还有不一致，再次修复
+   - 直到所有副本一致
+
+3. 最终一致性保证
+   - 多轮修复后收敛
+   - 通常 1-2 轮即可
+```
+
+---
+
+## 6. TinyExtent 的特殊处理
+
+### 问题
+
+TinyExtent 有删除记录 (punch hole)，修复时需要同步删除记录。
+
+```
+Leader TinyExtent 1:
+  [file_a] [hole] [file_c] [file_d]
+            ↑
+        已删除的 file_b
+
+Follower TinyExtent 1:
+  [file_a] [file_b] [file_c]  ← 还没有删除记录
+```
+
+### 解决
+
+```
+修复流程:
+  1. 同步 TINYEXTENT_DELETE 文件
+  2. Follower 读取删除记录
+  3. 对相应位置执行 punch hole
+  4. 然后补齐数据
+```
+
+---
+
+## 7. 修复触发时机
+
+| 触发条件 | 间隔 | 说明 |
+|----------|------|------|
+| 定时检查 | 60 秒 | 常规一致性检查 |
+| 分区创建后 | 立即 | 初始化 TinyExtent |
+| 节点重启后 | 立即 | 快速恢复一致性 |
+| Master 指令 | 按需 | 管理员手动触发 |
+
+### 检查间隔随机化
+
+```go
+const (
+    DpCheckBaseInterval = 7200   // 2 小时
+    DpCheckRandomRange  = 1800   // 随机 ±30 分钟
+)
+
+实际间隔 = 7200 + rand(-1800, 1800)
+         = 90 分钟 ~ 150 分钟
+```
+
+**为什么随机化？**
+- 避免所有分区同时检查
+- 减少网络和 CPU 峰值
+
+---
+
+## 8. 修复限流
+
+### 问题
+
+```
+场景: 节点重启后有 100 个分区需要修复
+
+不限流:
+  - 100 个分区同时修复
+  - 磁盘 IO 打满
+  - 正常读写延迟爆炸
+```
+
+### 解决
+
+```go
+// 限制并发修复的 Extent 数量
+const MaxExtentRepairReadLimit = 1
+
+// 每个磁盘一个限流 channel
+disk.extentRepairReadLimit = make(chan struct{}, MaxExtentRepairReadLimit)
+
+// 修复前获取令牌
+disk.extentRepairReadLimit <- struct{}{}
+defer func() { <-disk.extentRepairReadLimit }()
+```
+
+---
+
+## 9. 关键代码
+
+| 功能 | 位置 | 要点 |
+|------|------|------|
+| 修复入口 | data_partition_repair.go:102 | `repair()` |
+| 构建任务 | data_partition_repair.go:166 | `buildDataPartitionRepairTask()` |
+| 流式修复 | data_partition_repair.go | `streamRepairExtent()` |
+| 修复限流 | disk.go | `extentRepairReadLimit` |
+| 检查间隔 | partition.go:62-65 | `DpCheckBaseInterval` |
+
+---
+
+## 10. DataNode 学习总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      DataNode 架构全景                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Layer 1: 启动配置                                               │
+│    DataNode 启动 → 注册 Master → 加载磁盘 → 加载分区              │
+│                                                                  │
+│  Layer 2: 空间管理                                               │
+│    SpaceManager 管理多磁盘，Straw 算法选择磁盘                    │
+│                                                                  │
+│  Layer 3: 数据分区                                               │
+│    DataPartition (120GB) 是管理单元，每个分区独立 Raft           │
+│                                                                  │
+│  Layer 4: Extent 存储                                            │
+│    TinyExtent (小文件共享) + NormalExtent (大文件独占)           │
+│    Punch hole 实现小文件删除                                     │
+│                                                                  │
+│  Layer 5: 链式复制                                               │
+│    追加写: Leader → F1 → F2 (链式复制，高吞吐)                   │
+│                                                                  │
+│  Layer 6: Raft 一致性                                            │
+│    随机写 + 成员变更走 Raft (强一致)                              │
+│                                                                  │
+│  Layer 7: 数据修复                                               │
+│    定期检测 → 比较 → 流式修复 (最大版本获胜)                      │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+*更新时间：2026-04-27*

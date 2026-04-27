@@ -1,241 +1,256 @@
 # Layer 2: 磁盘与空间管理
 
-## 1. SpaceManager 结构
+## 核心问题
 
-SpaceManager 是 DataNode 的核心组件，负责管理所有磁盘和数据分区。
-
-```go
-// space_manager.go:48
-type SpaceManager struct {
-    clusterID      string
-    disks          map[string]*Disk          // 磁盘映射 (路径 -> Disk)
-    partitions     map[uint64]*DataPartition // 分区映射 (ID -> Partition)
-    raftStore      raftstore.RaftStore       // Raft 存储
-    nodeID         uint64
-    
-    diskMutex      sync.RWMutex              // 磁盘锁
-    partitionMutex sync.RWMutex              // 分区锁
-    
-    stats          *Stats                    // 统计信息
-    diskList       []string                  // 磁盘路径列表
-    dataNode       *DataNode                 // 反向引用
-    diskUtils      map[string]*atomicutil.Float64  // 磁盘利用率
-}
-```
-
-## 2. Disk 结构
-
-```go
-// disk.go:73
-type Disk struct {
-    sync.RWMutex
-    Path          string                    // 磁盘路径
-    
-    // 错误统计
-    ReadErrCnt    uint64                    // 读错误次数
-    WriteErrCnt   uint64                    // 写错误次数
-    MaxErrCnt     int                       // 最大容错次数
-    
-    // 空间信息
-    Total         uint64                    // 总空间
-    Used          uint64                    // 已用空间
-    Available     uint64                    // 可用空间
-    Unallocated   uint64                    // 未分配空间
-    Allocated     uint64                    // 已分配空间
-    ReservedSpace uint64                    // 预留空间
-    
-    // 状态
-    Status        int                       // 状态 (READONLY/Unavailable)
-    isLost        bool                      // 是否丢失
-    RejectWrite   bool                      // 拒绝写入
-    decommission  bool                      // 下线中
-    
-    // 分区管理
-    partitionMap  map[uint64]*DataPartition // 该磁盘上的分区
-    space         *SpaceManager             // 反向引用
-    
-    // QoS 限流器
-    limitRead       *util.IoLimiter         // 读限流
-    limitWrite      *util.IoLimiter         // 写限流
-    limitAsyncRead  *util.IoLimiter         // 异步读限流
-    limitAsyncWrite *util.IoLimiter         // 异步写限流
-    limitDelete     *util.IoLimiter         // 删除限流
-}
-```
-
-## 3. 层级关系
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                       DataNode                              │
-│                          │                                  │
-│                          ▼                                  │
-│  ┌───────────────────────────────────────────────────────┐ │
-│  │                   SpaceManager                         │ │
-│  │                                                        │ │
-│  │   disks: map[string]*Disk                             │ │
-│  │   ┌────────┬────────┬────────┐                        │ │
-│  │   │ Disk 1 │ Disk 2 │ Disk 3 │  ...                   │ │
-│  │   └───┬────┴───┬────┴───┬────┘                        │ │
-│  │       │        │        │                              │ │
-│  │   partitions: map[uint64]*DataPartition               │ │
-│  │   ┌────┬────┬────┬────┬────┬────┬────┐               │ │
-│  │   │DP1│DP2 │DP3 │DP4 │DP5 │DP6 │... │               │ │
-│  │   └────┴────┴────┴────┴────┴────┴────┘               │ │
-│  │                                                        │ │
-│  └───────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-
-Disk 与 DataPartition 的关系：
-┌────────────────────────────────────────┐
-│              Disk 1                     │
-│   Path: /data1                          │
-│   partitionMap:                         │
-│     ├── DP 1001                         │
-│     ├── DP 1002                         │
-│     └── DP 1003                         │
-└────────────────────────────────────────┘
-```
-
-## 4. 磁盘目录结构
-
-```
-/data1/                              # 磁盘挂载点
-├── .diskStatus                      # 磁盘状态文件（检测磁盘是否在线）
-├── datapartition_1001_3/            # 分区目录 (ID_副本数)
-│   ├── 1                            # Extent 文件
-│   ├── 2
-│   ├── ...
-│   ├── EXTENT_CRC                   # CRC 校验文件
-│   ├── EXTENT_META                  # 元数据文件
-│   └── wal_1001/                    # Raft WAL 日志
-├── datapartition_1002_3/
-└── expired_datapartition_xxx/       # 过期分区（待删除）
-```
-
-## 5. 磁盘状态管理
-
-### 5.1 状态类型
-
-| 状态 | 说明 |
-|------|------|
-| `ReadWrite` | 正常读写 |
-| `ReadOnly` | 只读（空间不足） |
-| `Unavailable` | 不可用（错误过多） |
-| `Lost` | 磁盘丢失 |
-| `Decommission` | 下线中 |
-
-### 5.2 磁盘丢失检测
-
-```go
-// space_manager.go:227
-func (manager *SpaceManager) checkAllDisksLost() {
-    for _, disk := range manager.disks {
-        path := path.Join(disk.Path, DiskStatusFile)
-        if _, err := os.Stat(path); err != nil {
-            // 磁盘丢失处理
-            manager.processLostDisk(disk.Path)
-        }
-    }
-}
-```
-
-通过检测 `.diskStatus` 文件是否存在来判断磁盘是否在线。
-
-## 6. 空间计算
-
-```go
-// disk.go
-func (d *Disk) computeUsage() (err error) {
-    // 获取文件系统信息
-    fs := syscall.Statfs_t{}
-    syscall.Statfs(d.Path, &fs)
-    
-    d.Total = fs.Blocks * uint64(fs.Bsize)
-    d.Available = fs.Bavail * uint64(fs.Bsize)
-    d.Used = d.Total - d.Available
-    
-    // 计算未分配空间
-    d.Unallocated = d.Total - d.ReservedSpace - d.Allocated
-}
-```
-
-**空间关系：**
-```
-Total = Used + Available
-Allocated = 所有分区实际占用
-Unallocated = Total - ReservedSpace - Allocated
-```
-
-## 7. QoS 限流
-
-每个磁盘有独立的 IO 限流器：
-
-```go
-// disk.go:177
-d.limitRead = util.NewIOLimiter(diskReadFlow, diskReadIocc)
-d.limitWrite = util.NewIOLimiter(diskWriteFlow, diskWriteIocc)
-d.limitAsyncRead = util.NewIOLimiter(diskAsyncReadFlow, diskAsyncReadIocc)
-d.limitAsyncWrite = util.NewIOLimiter(diskAsyncWriteFlow, diskAsyncWriteIocc)
-d.limitDelete = util.NewIOLimiter(diskDeleteFlow, diskDeleteIocc)
-```
-
-| 限流维度 | 说明 |
-|----------|------|
-| IOPS | 每秒 IO 操作数 |
-| Flow | 每秒流量 (bytes) |
-| IOCC | IO 并发数 |
-
-## 8. 核心流程
-
-### 8.1 加载磁盘
-
-```
-SpaceManager.LoadDisk()
-       │
-       ▼
-  NewDisk(path)
-       │
-       ├── computeUsage()        计算空间
-       ├── updateSpaceInfo()     更新空间信息
-       ├── 初始化限流器
-       └── startScheduleToUpdateSpaceInfo()  启动定时更新
-       │
-       ▼
-  disk.RestorePartition()
-       │
-       └── 遍历 datapartition_* 目录
-           │
-           └── LoadDataPartition()  加载每个分区
-```
-
-### 8.2 创建分区
-
-```
-Master 请求创建分区
-       │
-       ▼
-SpaceManager.CreatePartition()
-       │
-       ├── 选择磁盘 (负载均衡)
-       ├── 创建目录 datapartition_ID_ReplicaNum
-       ├── NewDataPartition()
-       └── 注册到 SpaceManager
-```
-
-## 9. 关键代码位置
-
-| 功能 | 文件:行号 |
-|------|-----------|
-| SpaceManager 结构 | space_manager.go:48 |
-| Disk 结构 | disk.go:73 |
-| 创建 Disk | disk.go:129 |
-| 磁盘丢失检测 | space_manager.go:216 |
-| 空间计算 | disk.go (computeUsage) |
+1. **SpaceManager 如何选择磁盘创建新分区？**
+2. **磁盘故障如何检测和处理？**
+3. **为什么需要 QoS 限流？**
 
 ---
 
-## 下一步
-- Layer 3: DataPartition 核心结构与操作
+## 1. 磁盘选择算法
 
-*创建时间：2026-04-12*
+当 Master 要求创建新分区时，SpaceManager 需要选择一个磁盘。
+
+### Straw 算法
+
+```go
+// space_manager.go:573
+func (manager *SpaceManager) selectDisk(decommissionedDisks []string) (d *Disk) {
+    maxStraw := float64(0)
+    for _, disk := range manager.disks {
+        // 跳过不可写、下线中、丢失的磁盘
+        if disk.Status != proto.ReadWrite || disk.isLost {
+            continue
+        }
+        
+        // 核心算法：Straw 加权随机
+        straw := float64(rand.Intn(65536))
+        straw = math.Log(straw/65536) / (float64(disk.Available) / util.GB)
+        
+        if straw > maxStraw {
+            maxStraw = straw
+            d = disk
+        }
+    }
+    return d
+}
+```
+
+**为什么用这个算法？**
+
+这是 CRUSH (Controlled Replication Under Scalable Hashing) 的 Straw 算法变体：
+- 每个磁盘抽一根"稻草" (straw)
+- 稻草长度 = 随机值 × 权重函数
+- 权重与**可用空间成正比**
+- 选中稻草最长的磁盘
+
+**效果**：
+- 可用空间大的磁盘被选中概率高
+- 但不是确定性的，有随机性
+- 自然实现负载均衡
+
+```
+Disk1: 可用 500GB  → 被选中概率 ~50%
+Disk2: 可用 300GB  → 被选中概率 ~30%
+Disk3: 可用 200GB  → 被选中概率 ~20%
+```
+
+---
+
+## 2. 磁盘故障检测
+
+### 检测机制
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     故障检测三道防线                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. 状态文件检测                                              │
+│     每个磁盘有 .diskStatus 文件                               │
+│     文件消失 → 磁盘可能挂载失败/被卸载                         │
+│                                                              │
+│  2. IO 错误计数                                               │
+│     读写操作累计错误次数                                       │
+│     超过 MaxErrCnt → 标记为 Unavailable                      │
+│                                                              │
+│  3. 分区级错误                                                │
+│     单个分区连续错误                                          │
+│     超过阈值 → 分区级故障隔离                                  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 为什么用文件检测而不是其他方式？
+
+| 方式 | 问题 |
+|------|------|
+| 定期 `df` 命令 | 挂载点存在但磁盘故障时仍会返回 |
+| SMART 监控 | 需要特殊权限，不跨平台 |
+| 文件存在性检测 | 简单可靠，磁盘故障时一定失败 |
+
+```go
+// 检测逻辑
+path := path.Join(disk.Path, ".diskStatus")
+if _, err := os.Stat(path); err != nil {
+    // 磁盘丢失！
+    manager.processLostDisk(disk.Path)
+}
+```
+
+### 故障处理流程
+
+```
+磁盘故障检测
+       │
+       ├─ .diskStatus 消失
+       │       │
+       │       ▼
+       │  标记 isLost = true
+       │       │
+       │       ▼
+       │  停止该磁盘所有分区的 Raft
+       │       │
+       │       ▼
+       │  上报 Master
+       │
+       └─ IO 错误超过阈值
+               │
+               ▼
+         Status = Unavailable
+               │
+               ▼
+         拒绝新分区创建
+               │
+               ▼
+         触发数据迁移
+```
+
+---
+
+## 3. 空间管理
+
+### 空间概念
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        磁盘 (10TB)                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Total = 10TB                                                │
+│  ├── ReservedSpace = 5GB    (预留空间，防止写满)             │
+│  ├── Allocated = 7TB        (已分配给分区)                   │
+│  │   ├── Used = 5TB         (分区实际使用)                   │
+│  │   └── 分区内空闲 = 2TB                                    │
+│  └── Unallocated = 3TB-5GB  (可用于新分区)                   │
+│                                                              │
+│  Available = 5TB            (文件系统实际剩余)                │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 为什么需要 ReservedSpace？
+
+**场景**：磁盘写满
+- Linux 文件系统满了，很多操作会失败
+- 包括 Raft 写日志
+- Raft 日志写不了 → 整个分区瘫痪
+
+**解决**：
+- 预留 5GB 空间
+- 可用空间 < ReservedSpace 时，磁盘变为只读
+- 但 Raft 和管理操作仍可进行
+
+---
+
+## 4. QoS 限流设计
+
+### 为什么需要限流？
+
+```
+问题场景：
+  用户 A: 大文件顺序读，打满磁盘带宽
+  用户 B: 小文件随机读，延迟爆炸
+  
+没有 QoS:
+  ┌─────────────────────────────────────┐
+  │ 磁盘带宽 500MB/s                     │
+  │ 用户A: 490MB/s  ██████████████████  │
+  │ 用户B:  10MB/s  █                   │  ← 延迟 10x
+  └─────────────────────────────────────┘
+  
+有 QoS:
+  ┌─────────────────────────────────────┐
+  │ 每用户限制 200MB/s                   │
+  │ 用户A: 200MB/s  ████████            │
+  │ 用户B: 200MB/s  ████████            │  ← 公平
+  └─────────────────────────────────────┘
+```
+
+### 限流维度
+
+| 限流器 | 控制对象 | 为什么单独限流 |
+|--------|----------|----------------|
+| `limitRead` | 同步读 | 前台请求，需要快速响应 |
+| `limitWrite` | 同步写 | 前台请求，需要快速响应 |
+| `limitAsyncRead` | 异步读 | 后台修复/预读，可以慢 |
+| `limitAsyncWrite` | 异步写 | 后台复制，可以慢 |
+| `limitDelete` | 删除操作 | 删除有 IO 开销，需要限流 |
+
+**设计思想**：前台优先，后台让步
+
+```go
+// 前台写：使用 limitWrite
+func (d *Disk) WriteSync(data []byte) {
+    d.limitWrite.Wait()  // 限流等待
+    // 实际写入
+}
+
+// 后台写（复制/修复）：使用 limitAsyncWrite
+func (d *Disk) WriteAsync(data []byte) {
+    d.limitAsyncWrite.Wait()  // 更严格的限流
+    // 实际写入
+}
+```
+
+---
+
+## 5. 目录结构设计
+
+```
+/data1/                                 # 磁盘挂载点
+├── .diskStatus                         # 磁盘在线标记
+├── datapartition_1001_3/               # 分区目录
+│   │                                   # 命名: datapartition_{ID}_{副本数}
+│   ├── META                            # 分区元数据 JSON
+│   ├── APPLY                           # Raft apply ID
+│   ├── EXTENT_CRC                      # Extent CRC 校验
+│   ├── EXTENT_META                     # Extent 元信息
+│   ├── wal_1001/                       # Raft WAL
+│   ├── 1, 2, ... 64                    # TinyExtent 文件
+│   └── 1024, 1025, ...                 # NormalExtent 文件
+├── expired_datapartition_1002_3/       # 待删除的过期分区
+│                                       # 保留 7 天后删除（安全起见）
+└── backup_datapartition_xxx/           # 备份分区（用于恢复）
+```
+
+**为什么过期分区要保留 7 天？**
+- 误删除保护
+- 给运维时间确认
+- 7 天后自动清理
+
+---
+
+## 6. 关键代码
+
+| 功能 | 位置 | 要点 |
+|------|------|------|
+| 磁盘选择 | space_manager.go:573 | Straw 算法，按可用空间加权随机 |
+| 磁盘丢失检测 | space_manager.go | 检查 `.diskStatus` 文件存在性 |
+| QoS 限流 | disk.go:97-102 | 五种限流器，前台/后台分离 |
+| 空间计算 | disk.go `computeUsage()` | 区分 Allocated/Used/Available |
+
+---
+
+*更新时间：2026-04-27*
