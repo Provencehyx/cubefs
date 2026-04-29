@@ -1,5 +1,103 @@
 # Layer 4: Extent 存储引擎
 
+## 核心数据结构
+
+### ExtentStore
+
+```go
+// datanode/storage/extent_store.go:125
+type ExtentStore struct {
+    dataPath           string                    // 数据目录路径
+    partitionID        uint64                    // 所属分区 ID
+    storeSize          int                       // 存储大小限制
+    
+    // Extent 管理
+    baseExtentID       uint64                    // 下一个可分配的 ExtentID
+    extentInfoMap      map[uint64]*ExtentInfo   // ExtentID → ExtentInfo
+    eiMutex            sync.RWMutex
+    cache              *ExtentCache              // Extent 缓存
+    
+    // 持久化文件句柄
+    metadataFp         *os.File                  // EXTENT_META 文件
+    tinyExtentDeleteFp *os.File                  // TINYEXTENT_DELETE 文件
+    normalExtentDeleteFp *os.File                // NORMALEXTENT_DELETE 文件
+    verifyExtentFp     *os.File                  // CRC 校验文件
+    
+    // TinyExtent 管理
+    availableTinyExtentC   chan uint64           // 可用的 TinyExtent 队列
+    availableTinyExtentMap sync.Map
+    brokenTinyExtentC      chan uint64           // 损坏的 TinyExtent 队列
+    brokenTinyExtentMap    sync.Map
+    
+    // 状态
+    closed             int32                     // 是否关闭
+    ApplyId            uint64                    // 当前 ApplyID
+    partitionType      int                       // 分区类型
+}
+```
+
+### Extent (内存中的 Extent 对象)
+
+```go
+// datanode/storage/extent.go:251
+type Extent struct {
+    file            *os.File       // 文件写句柄
+    readFile        *os.File       // 文件读句柄 (分离读写)
+    filePath        string         // 文件路径
+    extentID        uint64         // Extent ID
+    
+    modifyTime      int64          // 修改时间
+    accessTime      int64          // 访问时间
+    dataSize        int64          // 数据大小
+    snapshotDataOff uint64         // 快照数据偏移
+    
+    header          []byte         // 头部信息
+    hasClose        int32          // 是否已关闭
+    dirty           atomicutil.Bool // 是否有脏数据
+    sync.Mutex
+}
+```
+
+### ExtentInfo (Extent 元信息)
+
+```go
+// datanode/storage/extent.go:99
+type ExtentInfo struct {
+    IsDeleted       bool    `json:"deleted"`    // 是否已删除
+    Crc             uint32  `json:"Crc"`        // CRC 校验值
+    FileID          uint64  `json:"fileId"`     // 文件 ID (即 ExtentID)
+    Size            uint64  `json:"size"`       // 大小
+    ModifyTime      int64   `json:"modTime"`    // 修改时间
+    SnapshotDataOff uint64  `json:"snapSize"`   // 快照数据偏移
+    ApplyID         uint64  `json:"applyID"`    // 对应的 Raft ApplyID
+}
+```
+
+**数据结构关系**：
+
+```
+ExtentStore
+    │
+    ├── extentInfoMap (元信息索引)
+    │     ├── 1    → ExtentInfo {Size:50MB, CRC:0xABC}  (TinyExtent)
+    │     ├── 2    → ExtentInfo {Size:30MB, CRC:0xDEF}  (TinyExtent)
+    │     ├── 1024 → ExtentInfo {Size:128MB, CRC:0x123} (NormalExtent)
+    │     └── 1025 → ExtentInfo {Size:64MB, CRC:0x456}  (NormalExtent)
+    │
+    ├── cache (热点 Extent 对象缓存)
+    │     └── LRU cache of Extent objects
+    │
+    └── 磁盘文件
+          ├── 1, 2, ..., 64          (TinyExtent 文件)
+          ├── 1024, 1025, ...        (NormalExtent 文件)
+          ├── EXTENT_META            (baseExtentID)
+          ├── EXTENT_CRC             (分块 CRC)
+          ├── TINYEXTENT_DELETE      (删除记录)
+          └── NORMALEXTENT_DELETE    (删除记录)
+```
+
+---
+
 ## 核心问题
 
 1. **TinyExtent 为什么只有 64 个？**

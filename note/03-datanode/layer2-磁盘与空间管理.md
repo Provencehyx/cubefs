@@ -1,5 +1,90 @@
 # Layer 2: 磁盘与空间管理
 
+## 核心数据结构
+
+### SpaceManager
+
+```go
+// datanode/space_manager.go:48
+type SpaceManager struct {
+    clusterID      string                    // 集群 ID
+    disks          map[string]*Disk          // 路径 → 磁盘对象
+    partitions     map[uint64]*DataPartition // 分区ID → 分区对象
+    raftStore      raftstore.RaftStore       // Raft 存储
+    nodeID         uint64                    // 节点 ID
+    
+    diskMutex      sync.RWMutex              // 磁盘 map 锁
+    partitionMutex sync.RWMutex              // 分区 map 锁
+    
+    stats          *Stats                    // 统计信息
+    diskList       []string                  // 磁盘路径列表
+    diskUtils      map[string]*atomicutil.Float64  // 磁盘使用率
+    rand           *rand.Rand                // 随机数生成器 (Straw 算法)
+}
+```
+
+### Disk
+
+```go
+// datanode/disk.go:73
+type Disk struct {
+    sync.RWMutex
+    Path            string           // 挂载路径，如 /data1
+    
+    // 错误统计
+    ReadErrCnt      uint64           // 读错误计数
+    WriteErrCnt     uint64           // 写错误计数
+    MaxErrCnt       int              // 最大允许错误数
+    
+    // 空间管理
+    Total           uint64           // 磁盘总容量
+    Used            uint64           // 已使用空间
+    Available       uint64           // 可用空间
+    Unallocated     uint64           // 未分配空间
+    Allocated       uint64           // 已分配给分区的空间
+    ReservedSpace   uint64           // 预留空间 (防止写满)
+    DiskRdonlySpace uint64           // 只读阈值
+    
+    // 状态
+    Status          int              // 磁盘状态 (ReadWrite/ReadOnly/Unavailable)
+    isLost          bool             // 是否丢失
+    RejectWrite     bool             // 是否拒绝写入
+    
+    // 关联对象
+    partitionMap    map[uint64]*DataPartition  // 该磁盘上的分区
+    space           *SpaceManager              // 所属 SpaceManager
+    
+    // QoS 限流器 (5 种)
+    limitRead       *util.IoLimiter  // 同步读限流
+    limitWrite      *util.IoLimiter  // 同步写限流
+    limitAsyncRead  *util.IoLimiter  // 异步读限流 (修复/预读)
+    limitAsyncWrite *util.IoLimiter  // 异步写限流 (后台复制)
+    limitDelete     *util.IoLimiter  // 删除限流
+}
+```
+
+**数据结构关系**：
+
+```
+SpaceManager (1个)
+    │
+    ├── disks map
+    │     ├── "/data1" → Disk
+    │     │               └── partitionMap
+    │     │                     ├── 1001 → DataPartition
+    │     │                     └── 1002 → DataPartition
+    │     └── "/data2" → Disk
+    │                     └── partitionMap
+    │                           └── 1003 → DataPartition
+    │
+    └── partitions map (全局索引)
+          ├── 1001 → DataPartition
+          ├── 1002 → DataPartition
+          └── 1003 → DataPartition
+```
+
+---
+
 ## 核心问题
 
 1. **SpaceManager 如何选择磁盘创建新分区？**

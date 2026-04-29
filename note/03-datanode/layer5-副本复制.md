@@ -1,5 +1,96 @@
 # Layer 5: 链式复制协议
 
+## 核心数据结构
+
+### ReplProtocol (复制协议管理器)
+
+```go
+// datanode/repl/repl_protocol.go:39
+type ReplProtocol struct {
+    // 数据包管理
+    packetList      *list.List       // 已接收的数据包列表
+    packetListLock  sync.RWMutex
+    
+    // 处理通道
+    toBeProcessedCh chan *Packet     // 待处理数据包
+    responseCh      chan *Packet     // 响应数据包
+    ackCh           chan struct{}    // 所有副本写入成功信号
+    
+    // 网络连接
+    sourceConn      net.Conn         // 上游连接 (Client 或上游 DataNode)
+    followerConnects map[string]*FollowerTransport  // 下游副本连接
+    lock            sync.RWMutex
+    
+    // 处理函数 (可插拔)
+    prepareFunc     func(p *Packet) error              // 预处理
+    operatorFunc    func(p *Packet, c net.Conn) error  // 本地操作 (写 ExtentStore)
+    postFunc        func(p *Packet) error              // 后处理
+    
+    // SMUX 连接管理
+    getSmuxConn     func(addr string) (net.Conn, error)
+    putSmuxConn     func(conn net.Conn, force bool)
+    
+    // 状态
+    exitC           chan bool        // 退出信号
+    exited          int32            // 是否已退出
+    isError         int32            // 是否出错
+}
+```
+
+### FollowerTransport (下游副本连接)
+
+```go
+// datanode/repl/repl_protocol.go:67
+type FollowerTransport struct {
+    addr     string               // 下游地址
+    conn     net.Conn             // TCP 连接
+    sendCh   chan *FollowerPacket // 发送队列 (容量 200)
+    recvCh   chan *FollowerPacket // 接收队列 (容量 200)
+    exitCh   chan struct{}        // 退出信号
+    isclosed int32                // 是否已关闭
+}
+```
+
+**数据流转**：
+
+```
+Client 写入
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ ReplProtocol (Leader)                                           │
+│                                                                  │
+│  sourceConn ─→ packetList ─→ toBeProcessedCh                   │
+│                                    │                             │
+│                                    ▼                             │
+│                             operatorFunc()                       │
+│                             (写本地 ExtentStore)                 │
+│                                    │                             │
+│                                    ▼                             │
+│  followerConnects ──────────────────────────────────────────    │
+│       │                                                          │
+│       ├─→ FollowerTransport[F1]                                 │
+│       │       │                                                  │
+│       │       └─→ sendCh ─→ F1 ─→ recvCh ─→ ACK                │
+│       │                                                          │
+│       └─→ FollowerTransport[F2]                                 │
+│               │                                                  │
+│               └─→ sendCh ─→ F2 ─→ recvCh ─→ ACK                │
+│                                                                  │
+│  等待所有 ACK ─→ responseCh ─→ 返回 Client                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键设计**：
+
+| 组件 | 作用 | 为什么这样设计 |
+|------|------|---------------|
+| `sendCh` (容量200) | 异步发送缓冲 | 写磁盘和网络发送并行 |
+| `recvCh` (容量200) | 异步接收缓冲 | 不阻塞发送 |
+| `operatorFunc` | 可插拔操作函数 | 支持不同类型的写入操作 |
+
+---
+
 ## 核心问题
 
 1. **为什么不用 Raft 复制数据？**

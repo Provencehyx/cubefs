@@ -1,5 +1,83 @@
 # Layer 7: 数据修复
 
+## 核心数据结构
+
+### RepairExtentInfo (待修复 Extent 信息)
+
+```go
+// datanode/data_partition_repair.go:44
+type RepairExtentInfo struct {
+    storage.ExtentInfo           // 嵌入 ExtentInfo
+    Source string `json:"src"`  // 数据源地址 (从哪个副本读取)
+}
+
+// storage/extent.go:99 (嵌入的 ExtentInfo)
+type ExtentInfo struct {
+    IsDeleted   bool    // 是否已删除
+    Crc         uint32  // CRC 校验值
+    FileID      uint64  // Extent ID
+    Size        uint64  // 大小
+    ModifyTime  int64   // 修改时间
+    ApplyID     uint64  // Raft ApplyID
+}
+```
+
+### DataPartitionRepairTask (修复任务)
+
+```go
+// datanode/data_partition_repair.go:57
+type DataPartitionRepairTask struct {
+    TaskType            uint8                         // 任务类型
+    addr                string                        // 目标副本地址
+    extents             map[uint64]*RepairExtentInfo  // Extent 索引
+    
+    ExtentsToBeCreated  []*RepairExtentInfo  // 缺失的 Extent (需要完整复制)
+    ExtentsToBeRepaired []*RepairExtentInfo  // 不完整的 Extent (需要补齐)
+    
+    LeaderTinyDeleteRecordFileSize int64    // Leader 的删除记录文件大小
+    LeaderAddr          string               // Leader 地址
+}
+```
+
+**修复任务分类**：
+
+```
+Leader 收集所有副本的 Extent 信息
+           │
+           ▼
+┌──────────────────────────────────────────────────────────────┐
+│  比较结果                                                     │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ExtentsToBeCreated (缺失):                                   │
+│    Follower2 没有 Extent 1025                                │
+│    → 需要从 Leader 完整复制                                   │
+│                                                               │
+│  ExtentsToBeRepaired (不完整):                                │
+│    Follower2 的 Extent 1001: Size=80MB                       │
+│    Leader 的 Extent 1001:    Size=100MB                      │
+│    → 需要从 80MB 位置补齐 20MB                                │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**数据结构关系**：
+
+```
+DataPartitionRepairTask
+    │
+    ├── ExtentsToBeCreated
+    │     ├── RepairExtentInfo {FileID:1025, Size:128MB, Source:"dn1:17310"}
+    │     └── RepairExtentInfo {FileID:1026, Size:64MB, Source:"dn1:17310"}
+    │
+    └── ExtentsToBeRepaired
+          └── RepairExtentInfo {FileID:1001, Size:100MB, Source:"dn1:17310"}
+                                       ↑
+                                 目标大小，从 Source 读取补齐
+```
+
+---
+
 ## 核心问题
 
 1. **副本不一致如何检测？**

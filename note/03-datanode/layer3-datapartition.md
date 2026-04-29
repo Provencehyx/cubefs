@@ -1,5 +1,85 @@
 # Layer 3: DataPartition 核心
 
+## 核心数据结构
+
+```go
+// datanode/partition.go:102
+type DataPartition struct {
+    // 基本信息
+    clusterID       string           // 集群 ID
+    volumeID        string           // 卷 ID
+    partitionID     uint64           // 分区 ID
+    partitionStatus int              // 状态 (ReadWrite/ReadOnly/...)
+    partitionSize   int              // 分区大小 (默认 120GB)
+    partitionType   int              // 分区类型
+    replicaNum      int              // 副本数
+    
+    // 副本信息
+    replicas        []string         // 副本地址列表
+    replicasLock    sync.RWMutex
+    isLeader        bool             // 链式复制 Leader
+    isRaftLeader    bool             // Raft Leader
+    
+    // 关联对象
+    disk            *Disk            // 所属磁盘
+    dataNode        *DataNode        // 所属节点
+    path            string           // 分区目录路径
+    
+    // 存储引擎
+    extentStore     *storage.ExtentStore   // Extent 存储管理
+    raftPartition   raftstore.Partition    // Raft 分区
+    
+    // Raft 状态
+    appliedID       uint64           // 已应用的 Raft 日志 ID
+    lastTruncateID  uint64           // 最后截断的 ID
+    metaAppliedID   uint64           // 持久化的 ApplyID
+    minAppliedID    uint64           // 最小 ApplyID
+    maxAppliedID    uint64           // 最大 ApplyID
+    
+    // 控制信号
+    stopRaftC       chan uint64      // 停止 Raft 信号
+    storeC          chan uint64      // 存储信号
+    stopC           chan bool        // 停止信号
+    
+    // 快照与版本
+    snapshot        []*proto.File    // 快照信息
+    verSeq          uint64           // 版本序列号
+    
+    // 修复相关
+    decommissionRepairProgress float64  // 下线修复进度
+    stopRecover     bool             // 停止修复
+    recoverErrCnt   uint64           // 修复错误计数
+}
+```
+
+**关键字段说明**：
+
+| 字段 | 作用 |
+|------|------|
+| `isLeader` | 链式复制的 Leader，Client 写入首先到达此节点 |
+| `isRaftLeader` | Raft 协议的 Leader，处理随机写和成员变更 |
+| `extentStore` | 底层存储引擎，管理 TinyExtent 和 NormalExtent |
+| `raftPartition` | Raft 组，用于随机写一致性 |
+| `appliedID` | 已应用的 Raft 日志位点，重启恢复时使用 |
+
+**两个 Leader 的区别**：
+
+```
+通常 isLeader == isRaftLeader (同一节点)
+
+isLeader (链式复制):
+  - 控制数据写入顺序
+  - 数据: Client → Leader → Follower1 → Follower2
+
+isRaftLeader (Raft 协议):
+  - 控制成员变更
+  - 控制随机写顺序
+  - 日志: Leader ─┬─→ Follower1
+                  └─→ Follower2
+```
+
+---
+
 ## 核心问题
 
 1. **为什么分区大小是 120GB？**

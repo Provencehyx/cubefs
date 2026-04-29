@@ -1,5 +1,70 @@
 # Layer 6: Raft 一致性
 
+## 核心数据结构
+
+### DataPartition 中的 Raft 相关字段
+
+```go
+// datanode/partition.go:102 (部分)
+type DataPartition struct {
+    // ... 其他字段 ...
+    
+    // Raft 分区
+    raftPartition   raftstore.Partition    // Raft 组实例
+    
+    // Raft 状态跟踪
+    appliedID       uint64           // 已应用的最新 Raft 日志 ID
+    lastTruncateID  uint64           // 最后截断的日志 ID
+    metaAppliedID   uint64           // 已持久化的 ApplyID (APPLY 文件)
+    minAppliedID    uint64           // 副本中最小的 ApplyID
+    maxAppliedID    uint64           // 副本中最大的 ApplyID
+    
+    // Leader 状态
+    isRaftLeader    bool             // 是否为 Raft Leader
+    
+    // Raft 控制
+    raftStatus      int32            // Raft 状态
+    stopRaftC       chan uint64      // 停止 Raft 信号
+}
+```
+
+### Raft Apply 命令结构
+
+```go
+// proto/op_item.go (概念结构)
+type OpItem struct {
+    Op      uint8     // 操作类型
+    K       []byte    // Key (ExtentID + Offset)
+    V       []byte    // Value (数据)
+    Extents []byte    // Extent 信息
+}
+```
+
+**ApplyID 的作用**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     ApplyID 状态机                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Raft 日志:                                                      │
+│    [Log1] [Log2] [Log3] [Log4] [Log5] [Log6] [Log7]             │
+│                              ↑                                   │
+│                         appliedID = 5                            │
+│                                                                  │
+│  内存: appliedID = 5 (已应用到 Log5)                             │
+│  磁盘: metaAppliedID = 3 (APPLY 文件，持久化滞后)                 │
+│                                                                  │
+│  重启恢复:                                                       │
+│    1. 读取 APPLY → metaAppliedID = 3                            │
+│    2. 从 Log3 开始重放 Raft 日志                                 │
+│    3. 恢复到 appliedID = 7 (最新)                                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 核心问题
 
 1. **哪些操作必须走 Raft？**

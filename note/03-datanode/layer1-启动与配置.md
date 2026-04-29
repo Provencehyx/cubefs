@@ -1,5 +1,43 @@
 # Layer 1: DataNode 启动与配置
 
+## 核心数据结构
+
+```go
+// datanode/server.go:165
+type DataNode struct {
+    space           *SpaceManager    // 空间管理器（管理所有磁盘和分区）
+    port            string           // 服务端口
+    zoneName        string           // 可用区名称
+    clusterID       string           // 集群 ID
+    localServerAddr string           // 本机地址
+    nodeID          uint64           // 节点 ID（Master 分配）
+    
+    // Raft 相关
+    raftDir         string           // Raft 日志目录
+    raftHeartbeat   string           // Raft 心跳地址
+    raftReplica     string           // Raft 复制地址
+    raftStore       raftstore.RaftStore  // Raft 存储
+    
+    // 网络相关
+    tcpListener     net.Listener     // TCP 监听器
+    smuxListener    net.Listener     // SMUX 多路复用监听器
+    smuxConnPool    *util.SmuxConnectPool  // SMUX 连接池
+    
+    stopC           chan bool        // 停止信号
+}
+```
+
+**字段说明**：
+
+| 字段 | 作用 | 初始化时机 |
+|------|------|-----------|
+| `space` | 管理所有磁盘和分区 | `newSpaceManager()` |
+| `nodeID` | 唯一标识，Raft 需要 | `register()` 向 Master 注册后获得 |
+| `raftStore` | 管理多个 Raft 分组 | `startRaftServer()` |
+| `smuxConnPool` | SMUX 连接复用 | `startSmuxService()` |
+
+---
+
 ## 核心问题
 
 1. **启动顺序为什么是这样的？**
