@@ -369,20 +369,277 @@ func (mf *MetadataFsm) ApplySnapshot(peers []proto.Peer, iterator proto.SnapIter
 }
 ```
 
-## 10. Key 前缀
+## 10. RocksDB 数据全景
+
+### 10.1 数据模型总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Master RocksDB 数据模型                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │ Key                          │ Value (JSON)                         ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #c#cluster                   │ clusterValue {...}                   ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #vol#1                       │ volValue {name,capacity,...}         ││
+│  │ #vol#2                       │ volValue {...}                       ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #dp#1001                     │ dataPartitionValue {hosts,peers,...} ││
+│  │ #dp#1002                     │ dataPartitionValue {...}             ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #mp#2001                     │ metaPartitionValue {start,end,...}   ││
+│  │ #mp#2002                     │ metaPartitionValue {...}             ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #dn#192.168.1.1:17310        │ dataNodeValue {nodeSetID,zone,...}   ││
+│  │ #dn#192.168.1.2:17310        │ dataNodeValue {...}                  ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #mn#192.168.1.3:9021         │ metaNodeValue {nodeSetID,zone,...}   ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #s#1                         │ nodeSetValue {capacity,zone,...}     ││
+│  │ #s#2                         │ nodeSetValue {...}                   ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #zone#beijing-zone1          │ zoneValue {status,...}               ││
+│  ├──────────────────────────────┼──────────────────────────────────────┤│
+│  │ #max_dp_id                   │ "1050"                               ││
+│  │ #max_mp_id                   │ "2100"                               ││
+│  │ applied                      │ "12345"                              ││
+│  └──────────────────────────────┴──────────────────────────────────────┘│
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 Key 前缀定义
 
 ```go
-const (
-    clusterPrefix       = "#c"      // 集群配置
-    volPrefix           = "#vol_"   // 卷
-    dataNodePrefix      = "#dn_"    // DataNode
-    metaNodePrefix      = "#mn_"    // MetaNode
-    dataPartitionPrefix = "#dp_"    // DataPartition
-    metaPartitionPrefix = "#mp_"    // MetaPartition
-    nodeSetPrefix       = "#ns_"    // NodeSet
-    userPrefix          = "#user_"  // 用户
-)
+// master/const.go:442
+const keySeparator = "#"
+
+// 核心数据
+volPrefix           = "#vol#"      // Volume
+dataPartitionPrefix = "#dp#"       // DataPartition
+metaPartitionPrefix = "#mp#"       // MetaPartition
+dataNodePrefix      = "#dn#"       // DataNode
+metaNodePrefix      = "#mn#"       // MetaNode
+clusterPrefix       = "#c#"        // 集群配置
+nodeSetPrefix       = "#s#"        // NodeSet
+zonePrefix          = "#zone#"     // Zone
+
+// ID 计数器
+maxDataPartitionIDKey = "#max_dp_id"
+maxMetaPartitionIDKey = "#max_mp_id"
+maxCommonIDKey        = "#max_common_id"
+
+// 用户与权限
+userPrefix     = "#user#"
+akPrefix       = "#ak#"
+volUserPrefix  = "#voluser#"
+AclPrefix      = "#acl#"
+UidPrefix      = "#uid#"
+quotaPrefix    = "#quota#"
 ```
+
+### 10.3 核心 Value 结构详解
+
+#### clusterValue (集群全局配置)
+
+```go
+// metadata_fsm_op.go:37
+type clusterValue struct {
+    Name                    string   // 集群名称
+    CreateTime              int64    // 创建时间
+    Threshold               float32  // MetaNode 内存阈值
+    LoadFactor              float32  // 负载因子
+    DisableAutoAllocate     bool     // 禁止自动分配
+    FaultDomain             bool     // 是否启用故障域
+    MaxDpCntLimit           uint64   // 单节点最大 DP 数
+    MaxMpCntLimit           uint64   // 单节点最大 MP 数
+    DataNodeDeleteLimitRate uint64   // DN 删除限速
+    MetaNodeDeleteBatchCount uint64  // MN 删除批次
+    DecommissionLimit       uint64   // 下线并发数
+    // ... 50+ 配置项
+}
+```
+
+#### volValue (卷信息)
+
+```go
+// metadata_fsm_op.go:331
+type volValue struct {
+    ID                uint64   // 卷 ID
+    Name              string   // 卷名称
+    ReplicaNum        uint8    // MP 副本数
+    DpReplicaNum      uint8    // DP 副本数
+    Status            uint8    // 状态
+    DataPartitionSize uint64   // DP 大小 (默认 120GB)
+    Capacity          uint64   // 容量配额
+    Owner             string   // 所有者
+    ZoneName          string   // 所属 Zone
+    
+    // 读取策略
+    FollowerRead      bool     // 允许从 Follower 读
+    DirectRead        bool     // 直读模式
+    
+    // QoS 配置
+    IopsRLimit        uint64   // 读 IOPS 限制
+    IopsWLimit        uint64   // 写 IOPS 限制
+    FlowRlimit        uint64   // 读带宽限制
+    FlowWlimit        uint64   // 写带宽限制
+    
+    // 其他特性
+    EnablePosixAcl    bool     // POSIX ACL
+    EnableQuota       bool     // 配额
+    EnableTransaction proto.TxOpMask  // 事务
+    TrashInterval     int64    // 回收站保留时间
+    // ...
+}
+```
+
+#### dataPartitionValue (数据分区)
+
+```go
+// metadata_fsm_op.go:185
+type dataPartitionValue struct {
+    PartitionID    uint64        // 分区 ID
+    ReplicaNum     uint8         // 副本数
+    Hosts          string        // 副本地址 (下划线分隔)
+    Peers          []proto.Peer  // 副本 Peer 信息
+    Status         int8          // 状态
+    VolID          uint64        // 所属卷 ID
+    VolName        string        // 所属卷名
+    PartitionType  int           // 分区类型 (Normal/Cache)
+    MediaType      uint32        // 介质类型 (SSD/HDD)
+    
+    // 副本详情
+    Replicas       []*replicaValue  // [{Addr, DiskPath}, ...]
+    
+    // 下线状态
+    DecommissionStatus  uint32   // 下线状态
+    DecommissionSrcAddr string   // 下线源地址
+    DecommissionDstAddr string   // 下线目标地址
+    IsRecover           bool     // 是否恢复中
+    // ...
+}
+```
+
+#### metaPartitionValue (元数据分区)
+
+```go
+// metadata_fsm_op.go:150
+type metaPartitionValue struct {
+    PartitionID uint64        // 分区 ID
+    Start       uint64        // inode 起始范围
+    End         uint64        // inode 结束范围
+    VolID       uint64        // 所属卷 ID
+    VolName     string        // 所属卷名
+    ReplicaNum  uint8         // 副本数
+    Status      int8          // 状态
+    Hosts       string        // 副本地址
+    Peers       []proto.Peer  // 副本 Peer 信息
+    IsRecover   bool          // 是否恢复中
+}
+```
+
+#### dataNodeValue (数据节点)
+
+```go
+// metadata_fsm_op.go:514
+type dataNodeValue struct {
+    ID            uint64   // 节点 ID
+    NodeSetID     uint64   // 所属 NodeSet
+    Addr          string   // 地址 (IP:Port)
+    HeartbeatPort string   // 心跳端口
+    ReplicaPort   string   // 复制端口
+    ZoneName      string   // 所属 Zone
+    RdOnly        bool     // 只读模式
+    MediaType     uint32   // 介质类型
+    MaxDpCntLimit uint64   // 最大 DP 数
+    
+    // 下线相关
+    DecommissionStatus uint32    // 下线状态
+    DecommissionedDisks []string // 已下线磁盘
+    BadDisks            []string // 坏盘列表
+    AllDisks            []string // 所有磁盘
+}
+```
+
+#### metaNodeValue (元数据节点)
+
+```go
+// metadata_fsm_op.go:574
+type metaNodeValue struct {
+    ID            uint64   // 节点 ID
+    NodeSetID     uint64   // 所属 NodeSet
+    Addr          string   // 地址
+    HeartbeatPort string   // 心跳端口
+    ReplicaPort   string   // 复制端口
+    ZoneName      string   // 所属 Zone
+    RdOnly        bool     // 只读模式
+    maxMpCntLimit uint64   // 最大 MP 数
+}
+```
+
+#### nodeSetValue (节点组)
+
+```go
+// metadata_fsm_op.go:598
+type nodeSetValue struct {
+    ID               uint64  // NodeSet ID
+    Capacity         int     // 容量上限 (默认 18)
+    ZoneName         string  // 所属 Zone
+    DataNodeSelector string  // DN 选择策略
+    MetaNodeSelector string  // MN 选择策略
+}
+```
+
+### 10.4 数据关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Master 数据关系                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Cluster (#c#)                                                           │
+│      │                                                                   │
+│      ├── Zone (#zone#)                                                   │
+│      │     │                                                             │
+│      │     └── NodeSet (#s#)                                            │
+│      │           │                                                       │
+│      │           ├── DataNode (#dn#)                                    │
+│      │           │     └── [磁盘信息在心跳中上报，不持久化]               │
+│      │           │                                                       │
+│      │           └── MetaNode (#mn#)                                    │
+│      │                                                                   │
+│      └── Volume (#vol#)                                                  │
+│            │                                                             │
+│            ├── DataPartition (#dp#)                                     │
+│            │     └── Replica [内嵌在 dpValue 中]                         │
+│            │                                                             │
+│            └── MetaPartition (#mp#)                                     │
+│                  └── Replica [Hosts/Peers 字段]                          │
+│                                                                          │
+│  独立数据:                                                                │
+│      ├── User (#user#)                                                  │
+│      ├── AK (#ak#)                                                      │
+│      └── Quota (#quota#)                                                │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.5 数据量估算
+
+| 数据类型 | 单条大小 | 典型数量 | 总大小估算 |
+|---------|---------|---------|-----------|
+| clusterValue | ~2KB | 1 | 2KB |
+| volValue | ~1KB | 100 | 100KB |
+| dataPartitionValue | ~500B | 10,000 | 5MB |
+| metaPartitionValue | ~200B | 5,000 | 1MB |
+| dataNodeValue | ~300B | 100 | 30KB |
+| metaNodeValue | ~150B | 50 | 7.5KB |
+| nodeSetValue | ~100B | 20 | 2KB |
+
+**典型集群 RocksDB 大小**：10-100MB（元数据很小）
 
 ## 11. 数据流转图
 
@@ -450,3 +707,4 @@ Master 笔记完成，共 7 层：
 7. **元数据持久化** - Raft + RocksDB
 
 *创建时间：2026-04-12*
+*更新时间：2026-05-07 - 添加 RocksDB 数据全景*
